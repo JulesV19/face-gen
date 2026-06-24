@@ -1,0 +1,202 @@
+"""
+Training entry-point.
+
+    python train.py --data_dir /content/data --max_epochs 100
+
+All Config fields are saved as flat hparams so that
+    CVAEModule.load_from_checkpoint(path)
+works without any extra hooks in generate.py.
+"""
+import argparse
+import dataclasses
+
+import torch
+import torch.nn.functional as F
+import torchvision
+import pytorch_lightning as pl
+import wandb
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.loggers import WandbLogger
+from torch.utils.data import DataLoader
+
+from config import Config
+from dataset import CelebADataset
+from model import CVAE
+
+
+# ── Lightning module ──────────────────────────────────────────────────────────
+
+
+class CVAEModule(pl.LightningModule):
+    def __init__(self, **cfg_kwargs):
+        super().__init__()
+        # Store as flat primitives so PL can serialize/deserialize cleanly
+        self.save_hyperparameters()
+        self.cfg = Config(**cfg_kwargs)
+        self.model = CVAE(
+            img_size=self.cfg.img_size,
+            num_attrs=self.cfg.num_attrs,
+            latent_dim=self.cfg.latent_dim,
+        )
+        self._val_fixed: tuple | None = None
+
+    # ── forward ───────────────────────────────────────────────────────────
+
+    def forward(self, x, c):
+        return self.model(x, c)
+
+    # ── KL schedule ───────────────────────────────────────────────────────
+
+    def _beta(self) -> float:
+        progress = min(1.0, self.current_epoch / max(1, self.cfg.warmup_epochs))
+        return self.cfg.beta_max * progress
+
+    # ── shared step ───────────────────────────────────────────────────────
+
+    def _step(self, batch, stage: str) -> torch.Tensor:
+        x, c = batch
+        recon, mu, logvar = self(x, c)
+
+        recon_loss = F.mse_loss(recon, x, reduction="sum") / x.size(0)
+        kl_loss = (
+            -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
+        )
+        loss = recon_loss + self._beta() * kl_loss
+
+        on_step = stage == "train"
+        self.log_dict(
+            {
+                f"{stage}/loss": loss,
+                f"{stage}/recon": recon_loss,
+                f"{stage}/kl": kl_loss,
+                f"{stage}/beta": self._beta(),
+            },
+            prog_bar=on_step,
+            on_step=on_step,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        return loss
+
+    def training_step(self, batch, _):
+        return self._step(batch, "train")
+
+    def validation_step(self, batch, batch_idx):
+        if batch_idx == 0:
+            self._val_fixed = batch
+        return self._step(batch, "val")
+
+    # ── image logging ─────────────────────────────────────────────────────
+
+    def on_validation_epoch_end(self):
+        if self._val_fixed is None or not isinstance(self.logger, WandbLogger):
+            return
+
+        x, c = self._val_fixed
+        n = min(self.cfg.val_log_n_images, x.size(0))
+        x, c = x[:n].to(self.device), c[:n].to(self.device)
+
+        with torch.no_grad():
+            recon, _, _ = self.model(x, c)
+
+        grid = torchvision.utils.make_grid(
+            torch.cat([x, recon]),
+            nrow=n,
+            normalize=True,
+            value_range=(-1, 1),
+        )
+        self.logger.experiment.log(
+            {"val/reconstructions": wandb.Image(grid), "epoch": self.current_epoch}
+        )
+
+    # ── optimiser ─────────────────────────────────────────────────────────
+
+    def configure_optimizers(self):
+        opt = torch.optim.Adam(
+            self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay
+        )
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=self.cfg.max_epochs, eta_min=1e-5
+        )
+        return {
+            "optimizer": opt,
+            "lr_scheduler": {"scheduler": sched, "interval": "epoch"},
+        }
+
+    # ── data ──────────────────────────────────────────────────────────────
+
+    def train_dataloader(self):
+        ds = CelebADataset(self.cfg.data_dir, "train", self.cfg.img_size)
+        return DataLoader(
+            ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            persistent_workers=self.cfg.num_workers > 0,
+        )
+
+    def val_dataloader(self):
+        ds = CelebADataset(self.cfg.data_dir, "val", self.cfg.img_size)
+        return DataLoader(
+            ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            persistent_workers=self.cfg.num_workers > 0,
+        )
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+
+def _parse() -> Config:
+    defaults = Config()
+    p = argparse.ArgumentParser()
+    for f in dataclasses.fields(defaults):
+        p.add_argument(f"--{f.name}", type=type(f.default), default=None)
+    args = p.parse_args()
+
+    cfg = Config()
+    for f in dataclasses.fields(cfg):
+        v = getattr(args, f.name)
+        if v is not None:
+            setattr(cfg, f.name, v)
+    return cfg
+
+
+def main():
+    cfg = _parse()
+
+    wandb_logger = WandbLogger(project=cfg.wandb_project, log_model=False)
+
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=cfg.ckpt_dir,
+            filename="cvae-epoch{epoch:03d}-valloss{val/loss:.3f}",
+            monitor="val/loss",
+            save_top_k=3,
+            mode="min",
+            auto_insert_metric_name=False,
+        ),
+        LearningRateMonitor(logging_interval="epoch"),
+    ]
+
+    module = CVAEModule(**dataclasses.asdict(cfg))
+
+    trainer = pl.Trainer(
+        max_epochs=cfg.max_epochs,
+        accelerator="gpu",
+        devices=1,
+        precision=cfg.precision,
+        gradient_clip_val=cfg.grad_clip,
+        callbacks=callbacks,
+        logger=wandb_logger,
+        log_every_n_steps=cfg.log_every_n_steps,
+    )
+    trainer.fit(module)
+
+
+if __name__ == "__main__":
+    main()

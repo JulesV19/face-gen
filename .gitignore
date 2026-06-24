@@ -1,0 +1,35 @@
+# Data
+data/
+*.jpg
+*.png
+*.zip
+
+# Checkpoints & model outputs
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+generated*.png
+manipulated*.png
+
+# Wandb
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Env
+.env
+.venv/
+venv/
+
+# Jupyter / Colab
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
