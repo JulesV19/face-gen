@@ -153,3 +153,30 @@ class CVAE(nn.Module):
         """
         mu = self.encode_mu(x, c_source)
         return self.decoder(mu, c_target)
+
+
+# ── Auxiliary attribute classifier ────────────────────────────────────────────
+
+
+class AttrClassifier(nn.Module):
+    """Small CNN: image in [-1, 1] → 40 attribute logits.
+
+    Optional auxiliary signal (enabled by Config.attr_loss_weight > 0): trained on
+    real images, then used to push the CVAE decoder into actually honouring the
+    condition c — counters the classic failure where the decoder ignores c because
+    z already carries every attribute it needs to reconstruct.
+    """
+
+    def __init__(self, img_size: int = 64, num_attrs: int = 40):
+        super().__init__()
+        self.net = nn.Sequential(
+            _conv_down(3, 64),
+            _conv_down(64, 128),
+            _conv_down(128, 256),
+            _conv_down(256, 512),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.fc = nn.Linear(512, num_attrs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(self.net(x).flatten(1))

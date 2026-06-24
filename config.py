@@ -22,6 +22,9 @@ class Config:
     beta_max: float = 1.0
     warmup_epochs: int = 10
     grad_clip: float = 1.0
+    # Auxiliary attribute-classifier loss to force the decoder to honour c.
+    # 0 = disabled (default, unchanged behaviour). Try 0.1–1.0 to enable.
+    attr_loss_weight: float = 0.0
     # "bf16-mixed" recommended on A100; use "16-mixed" on T4
     precision: str = "bf16-mixed"
 

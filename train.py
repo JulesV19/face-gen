@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 
 from config import Config
 from dataset import CelebADataset
-from model import CVAE
+from model import AttrClassifier, CVAE
 
 
 # ── Lightning module ──────────────────────────────────────────────────────────
@@ -41,6 +41,12 @@ class CVAEModule(pl.LightningModule):
             img_size=self.cfg.img_size,
             num_attrs=self.cfg.num_attrs,
             latent_dim=self.cfg.latent_dim,
+        )
+        # Optional — built only when the auxiliary attribute loss is enabled.
+        self.aux = (
+            AttrClassifier(self.cfg.img_size, self.cfg.num_attrs)
+            if self.cfg.attr_loss_weight > 0
+            else None
         )
         self._val_fixed: tuple | None = None
 
@@ -67,14 +73,26 @@ class CVAEModule(pl.LightningModule):
         )
         loss = recon_loss + self._beta() * kl_loss
 
+        logs = {
+            f"{stage}/loss": loss,
+            f"{stage}/recon": recon_loss,
+            f"{stage}/kl": kl_loss,
+            f"{stage}/beta": self._beta(),
+        }
+
+        if self.aux is not None:
+            # cls_loss trains the classifier on real images; attr_loss pushes the
+            # decoder so the classifier reads c back off the reconstruction.
+            cls_loss = F.binary_cross_entropy_with_logits(self.aux(x), c)
+            attr_loss = F.binary_cross_entropy_with_logits(self.aux(recon), c)
+            loss = loss + cls_loss + self.cfg.attr_loss_weight * attr_loss
+            logs[f"{stage}/loss"] = loss
+            logs[f"{stage}/cls"] = cls_loss
+            logs[f"{stage}/attr"] = attr_loss
+
         on_step = stage == "train"
         self.log_dict(
-            {
-                f"{stage}/loss": loss,
-                f"{stage}/recon": recon_loss,
-                f"{stage}/kl": kl_loss,
-                f"{stage}/beta": self._beta(),
-            },
+            logs,
             prog_bar=on_step,
             on_step=on_step,
             on_epoch=True,
