@@ -223,16 +223,6 @@ def main():
     wandb_logger = WandbLogger(project=cfg.wandb_project, log_model=False)
 
     callbacks = [
-        # Keeps the 3 best checkpoints with readable names for manual recovery.
-        ModelCheckpoint(
-            dirpath=cfg.ckpt_dir,
-            filename="cvae-epoch{epoch:03d}-valloss{val/loss:.3f}",
-            monitor="val/loss",
-            save_top_k=3,
-            mode="min",
-            auto_insert_metric_name=False,
-        ),
-        # Always keeps a single `best.ckpt` pointing to the current best.
         ModelCheckpoint(
             dirpath=cfg.ckpt_dir,
             filename="best",
