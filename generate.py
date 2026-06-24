@@ -26,16 +26,34 @@ from torchvision import transforms
 from config import Config
 from dataset import ATTR_NAMES
 from model import CVAE
-from train import CVAEModule
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
 def load_model(ckpt_path: str, device: str = "cuda") -> tuple[CVAE, Config]:
-    module = CVAEModule.load_from_checkpoint(ckpt_path, map_location=device)
-    module.eval().to(device)
-    return module.model, module.cfg
+    """Load a Lightning checkpoint into the bare CVAE.
+
+    Inference deliberately does NOT import the training stack (pytorch_lightning,
+    wandb): a Lightning .ckpt is just a dict with `state_dict` + `hyper_parameters`.
+    We rebuild Config from the saved hparams and strip the `model.` prefix that
+    CVAEModule adds (since it holds the net as `self.model`).
+    """
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    cfg = Config(**ckpt["hyper_parameters"])
+    model = CVAE(
+        img_size=cfg.img_size,
+        num_attrs=cfg.num_attrs,
+        latent_dim=cfg.latent_dim,
+    )
+    state = {
+        k[len("model."):]: v
+        for k, v in ckpt["state_dict"].items()
+        if k.startswith("model.")
+    }
+    model.load_state_dict(state)
+    model.eval().to(device)
+    return model, cfg
 
 
 def attrs_from_str(spec: str) -> dict[str, float]:
