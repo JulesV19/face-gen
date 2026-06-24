@@ -22,25 +22,56 @@ def _conv_up(in_ch: int, out_ch: int) -> nn.Sequential:
     )
 
 
+class SelfAttn2d(nn.Module):
+    """Residual self-attention at a given spatial resolution."""
+
+    def __init__(self, ch: int, num_heads: int = 4):
+        super().__init__()
+        self.norm = nn.GroupNorm(min(8, ch // 8), ch)
+        self.attn = nn.MultiheadAttention(ch, num_heads=num_heads, batch_first=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        h = self.norm(x).flatten(2).transpose(1, 2)  # (B, H*W, C)
+        h, _ = self.attn(h, h, h)
+        return x + h.transpose(1, 2).view(B, C, H, W)
+
+
+class FiLM(nn.Module):
+    """Feature-wise Linear Modulation: c → per-channel gamma/beta applied to conv features."""
+
+    def __init__(self, num_attrs: int, num_ch: int):
+        super().__init__()
+        self.gamma = nn.Linear(num_attrs, num_ch)
+        self.beta  = nn.Linear(num_attrs, num_ch)
+        # Init so the layer starts as an identity transform
+        nn.init.zeros_(self.gamma.weight); nn.init.ones_(self.gamma.bias)
+        nn.init.zeros_(self.beta.weight);  nn.init.zeros_(self.beta.bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        γ = self.gamma(c)[:, :, None, None]  # (B, C, 1, 1)
+        β = self.beta(c)[:, :, None, None]
+        return γ * x + β
+
+
 # ── Encoder ───────────────────────────────────────────────────────────────────
 
 
 class Encoder(nn.Module):
     """Image + condition → (μ, log σ²).
 
-    CNN path: 3×64 → 64×32 → 128×16 → 256×8 → 512×4
+    CNN path: 3×64 → 64×32 → 128×16 → 256×8 → [self-attn] → 512×4
     Then flatten, concat condition, project to μ and logvar.
     """
 
     def __init__(self, img_size: int = 64, num_attrs: int = 40, latent_dim: int = 256):
         super().__init__()
-        self.cnn = nn.Sequential(
-            _conv_down(3, 64),
-            _conv_down(64, 128),
-            _conv_down(128, 256),
-            _conv_down(256, 512),
-        )
-        # spatial size after 4× stride-2: img_size // 16
+        self.down1 = _conv_down(3, 64)
+        self.down2 = _conv_down(64, 128)
+        self.down3 = _conv_down(128, 256)
+        self.attn  = SelfAttn2d(256, num_heads=4)   # at 8×8 spatial resolution
+        self.down4 = _conv_down(256, 512)
+
         spatial = img_size // 16
         flat_dim = 512 * spatial * spatial  # 8192 for img_size=64
 
@@ -48,13 +79,13 @@ class Encoder(nn.Module):
             nn.Linear(flat_dim + num_attrs, 1024),
             nn.ReLU(inplace=True),
         )
-        self.fc_mu = nn.Linear(1024, latent_dim)
+        self.fc_mu     = nn.Linear(1024, latent_dim)
         self.fc_logvar = nn.Linear(1024, latent_dim)
 
     def forward(
         self, x: torch.Tensor, c: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.cnn(x).flatten(1)
+        h = self.down4(self.attn(self.down3(self.down2(self.down1(x))))).flatten(1)
         h = self.fc(torch.cat([h, c], dim=1))
         return self.fc_mu(h), self.fc_logvar(h)
 
@@ -63,7 +94,11 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """(z, condition) → image in [-1, 1]."""
+    """(z, condition) → image in [-1, 1].
+
+    FiLM layers after each deconv block inject the condition at every scale,
+    forcing the decoder to honour c rather than relying solely on z.
+    """
 
     def __init__(self, img_size: int = 64, num_attrs: int = 40, latent_dim: int = 256):
         super().__init__()
@@ -76,11 +111,12 @@ class Decoder(nn.Module):
             nn.Linear(1024, flat_dim),
             nn.ReLU(inplace=True),
         )
-        self.deconv = nn.Sequential(
-            _conv_up(512, 256),
-            _conv_up(256, 128),
-            _conv_up(128, 64),
-            _conv_up(64, 32),
+
+        chs = [512, 256, 128, 64, 32]
+        self.ups   = nn.ModuleList([_conv_up(chs[i], chs[i + 1]) for i in range(4)])
+        self.films = nn.ModuleList([FiLM(num_attrs, chs[i + 1]) for i in range(4)])
+
+        self.head = nn.Sequential(
             nn.Conv2d(32, 3, kernel_size=3, stride=1, padding=1),
             nn.Tanh(),
         )
@@ -88,7 +124,9 @@ class Decoder(nn.Module):
     def forward(self, z: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         h = self.fc(torch.cat([z, c], dim=1))
         h = h.view(h.size(0), 512, self.spatial, self.spatial)
-        return self.deconv(h)
+        for up, film in zip(self.ups, self.films):
+            h = film(up(h), c)
+        return self.head(h)
 
 
 # ── CVAE ─────────────────────────────────────────────────────────────────────
@@ -113,10 +151,6 @@ class CVAE(nn.Module):
         self, x: torch.Tensor, c: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mu, logvar = self.encoder(x, c)
-        # Clamp logvar so exp() (in reparam std and in the KL term) cannot
-        # overflow to inf — without this the reparameterisation explodes during
-        # the β=0 warmup epoch (no KL pressure on the variance) and everything
-        # turns into NaN. Range [-10, 10] keeps std in [~0.007, ~148].
         logvar = logvar.clamp(-10.0, 10.0)
         z = self.reparameterize(mu, logvar)
         return self.decoder(z, c), mu, logvar
@@ -147,10 +181,7 @@ class CVAE(nn.Module):
         c_source: torch.Tensor,
         c_target: torch.Tensor,
     ) -> torch.Tensor:
-        """Encode with source condition, decode with target condition.
-
-        Lets you flip one or more attributes on a real photo.
-        """
+        """Encode with source condition, decode with target condition."""
         mu = self.encode_mu(x, c_source)
         return self.decoder(mu, c_target)
 

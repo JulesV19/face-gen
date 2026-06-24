@@ -9,6 +9,11 @@ python generate.py generate \\
     --attrs "Blond_Hair=1,Smiling=1,Young=1" \\
     --n 8 --out generated.png
 
+# generate a big gallery of varied, randomly-characterised faces
+python generate.py gallery \\
+    --ckpt checkpoints/best.ckpt \\
+    --n 64 --cols 8 --out gallery.png
+
 # flip Smiling on a real photo
 python generate.py manipulate \\
     --ckpt checkpoints/best.ckpt \\
@@ -20,7 +25,7 @@ import argparse
 
 import torch
 import torchvision
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
 
 from config import Config
@@ -84,6 +89,79 @@ def build_condition(
     return c.to(device)
 
 
+def random_condition_batch(
+    n: int,
+    num_attrs: int = 40,
+    device: str = "cuda",
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Build (n, num_attrs) condition vectors with diverse *coherent* faces.
+
+    Independent Bernoulli over 40 attributes yields incoherent monsters
+    (blond AND black hair, male with heavy makeup, …).  Instead we sample
+    structured, mutually-consistent attribute sets per face:
+
+      • exactly one hair colour (or none → bald)
+      • gender, with correlated grooming (beard/makeup/lipstick)
+      • age, expression, and a few low-probability accessories.
+    """
+    def idx(name: str) -> int:
+        return ATTR_NAMES.index(name)
+
+    g = generator
+    c = torch.zeros(n, num_attrs, device="cpu")
+
+    for i in range(n):
+        male = torch.rand(1, generator=g).item() < 0.5
+        young = torch.rand(1, generator=g).item() < 0.7
+
+        c[i, idx("Male")] = float(male)
+        c[i, idx("Young")] = float(young)
+
+        # ── hair: pick one colour bucket (with a chance of bald) ──────────
+        hair_opts = ["Black_Hair", "Blond_Hair", "Brown_Hair", "Gray_Hair"]
+        roll = torch.rand(1, generator=g).item()
+        if male and roll < 0.05:
+            c[i, idx("Bald")] = 1.0
+        else:
+            pick = int(torch.randint(len(hair_opts), (1,), generator=g).item())
+            c[i, idx(hair_opts[pick])] = 1.0
+        if torch.rand(1, generator=g).item() < 0.4:
+            c[i, idx("Wavy_Hair" if torch.rand(1, generator=g).item() < 0.5
+                     else "Straight_Hair")] = 1.0
+
+        # ── grooming, correlated with gender ──────────────────────────────
+        if male:
+            if torch.rand(1, generator=g).item() < 0.4:
+                c[i, idx("No_Beard")] = 0.0
+                c[i, idx("Mustache")] = float(torch.rand(1, generator=g).item() < 0.4)
+                c[i, idx("Goatee")] = float(torch.rand(1, generator=g).item() < 0.4)
+                c[i, idx("5_o_Clock_Shadow")] = float(torch.rand(1, generator=g).item() < 0.5)
+            else:
+                c[i, idx("No_Beard")] = 1.0
+        else:
+            c[i, idx("No_Beard")] = 1.0
+            heavy = torch.rand(1, generator=g).item() < 0.6
+            c[i, idx("Heavy_Makeup")] = float(heavy)
+            c[i, idx("Wearing_Lipstick")] = float(heavy or torch.rand(1, generator=g).item() < 0.4)
+            c[i, idx("Wearing_Earrings")] = float(torch.rand(1, generator=g).item() < 0.3)
+            c[i, idx("Arched_Eyebrows")] = float(torch.rand(1, generator=g).item() < 0.4)
+
+        # ── expression ────────────────────────────────────────────────────
+        smiling = torch.rand(1, generator=g).item() < 0.5
+        c[i, idx("Smiling")] = float(smiling)
+        c[i, idx("High_Cheekbones")] = float(smiling)
+        c[i, idx("Mouth_Slightly_Open")] = float(smiling and torch.rand(1, generator=g).item() < 0.6)
+
+        # ── occasional accessories ────────────────────────────────────────
+        c[i, idx("Eyeglasses")] = float(torch.rand(1, generator=g).item() < 0.2)
+        c[i, idx("Wearing_Hat")] = float(torch.rand(1, generator=g).item() < 0.1)
+        if not young:
+            c[i, idx("Gray_Hair")] = float(torch.rand(1, generator=g).item() < 0.4)
+
+    return c.to(device)
+
+
 def load_image(path: str, img_size: int = 64, device: str = "cuda") -> torch.Tensor:
     """Load and preprocess a single image → (1, 3, H, W) in [-1, 1]."""
     tf = transforms.Compose([
@@ -109,6 +187,81 @@ def save_grid(tensor: torch.Tensor, path: str, nrow: int | None = None):
     print(f"Saved → {path}")
 
 
+def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/SFNSMono.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def save_annotated_gallery(
+    imgs: torch.Tensor,
+    conditions: torch.Tensor,
+    path: str,
+    ncols: int = 4,
+    face_size: int = 128,
+    text_w: int = 220,
+    font_size: int = 9,
+):
+    """Save a gallery where each face cell shows the face + its active attributes."""
+    font = _load_font(font_size)
+    line_h = font_size + 3
+    padding = 5
+    cell_w = face_size + text_w
+    cell_h = face_size
+
+    n = imgs.size(0)
+    nrows = (n + ncols - 1) // ncols
+
+    canvas = Image.new("RGB", (cell_w * ncols, cell_h * nrows), color=(30, 30, 30))
+    draw = ImageDraw.Draw(canvas)
+
+    # [-1,1] → uint8
+    imgs_u8 = ((imgs.cpu().float().clamp(-1, 1) + 1) / 2 * 255).byte()
+
+    for i in range(n):
+        row, col = divmod(i, ncols)
+        x0, y0 = col * cell_w, row * cell_h
+
+        # ── face ──────────────────────────────────────────────────────────
+        face = Image.fromarray(imgs_u8[i].permute(1, 2, 0).numpy()).resize(
+            (face_size, face_size), Image.LANCZOS
+        )
+        canvas.paste(face, (x0, y0))
+
+        # ── attribute list ─────────────────────────────────────────────────
+        tx0 = x0 + face_size
+        draw.rectangle([tx0, y0, tx0 + text_w - 1, y0 + cell_h - 1], fill=(20, 20, 20))
+
+        active = [
+            ATTR_NAMES[j].replace("_", " ")
+            for j in range(len(ATTR_NAMES))
+            if conditions[i, j].item() >= 0.5
+        ]
+
+        ty = y0 + padding
+        for attr in active:
+            if ty + line_h > y0 + cell_h - padding:
+                break
+            draw.text((tx0 + padding, ty), f"• {attr}", fill=(200, 230, 200), font=font)
+            ty += line_h
+
+        # subtle separator
+        draw.line([(x0, y0), (x0, y0 + cell_h - 1)], fill=(60, 60, 60), width=1)
+        draw.line([(x0, y0), (x0 + cell_w - 1, y0)], fill=(60, 60, 60), width=1)
+
+    canvas.save(path)
+    print(f"Saved → {path}")
+
+
 # ── commands ──────────────────────────────────────────────────────────────────
 
 
@@ -121,6 +274,22 @@ def cmd_generate(args):
 
     imgs = model.generate(c, n=args.n)
     save_grid(imgs, args.out, nrow=args.n)
+
+
+def cmd_gallery(args):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, cfg = load_model(args.ckpt, device)
+
+    g = None
+    if args.seed is not None:
+        g = torch.Generator().manual_seed(args.seed)
+
+    c = random_condition_batch(args.n, cfg.num_attrs, device=device, generator=g)
+    imgs = model.generate(c)
+    save_annotated_gallery(
+        imgs, c.cpu(), args.out, ncols=args.cols, face_size=args.face_size,
+        text_w=240, font_size=12,
+    )
 
 
 def cmd_manipulate(args):
@@ -158,6 +327,16 @@ def main():
     gen.add_argument("--n", type=int, default=8)
     gen.add_argument("--out", default="generated.png")
 
+    gal = sub.add_parser(
+        "gallery", help="Sample many faces, each with different random attributes"
+    )
+    gal.add_argument("--ckpt", required=True)
+    gal.add_argument("--n", type=int, default=32, help="Number of faces")
+    gal.add_argument("--cols", type=int, default=4, help="Faces per row in the grid")
+    gal.add_argument("--face-size", type=int, default=128, help="Face tile size in px")
+    gal.add_argument("--seed", type=int, default=None, help="Reproducible sampling")
+    gal.add_argument("--out", default="gallery.png")
+
     man = sub.add_parser("manipulate", help="Flip attributes on a real image")
     man.add_argument("--ckpt", required=True)
     man.add_argument("--img", required=True, help="Path to input face image")
@@ -166,7 +345,11 @@ def main():
     man.add_argument("--out", default="manipulated.png")
 
     args = p.parse_args()
-    {"generate": cmd_generate, "manipulate": cmd_manipulate}[args.cmd](args)
+    {
+        "generate": cmd_generate,
+        "gallery": cmd_gallery,
+        "manipulate": cmd_manipulate,
+    }[args.cmd](args)
 
 
 if __name__ == "__main__":

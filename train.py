@@ -28,6 +28,32 @@ from dataset import CelebADataset
 from model import AttrClassifier, CVAE
 
 
+# ── Perceptual loss ───────────────────────────────────────────────────────────
+
+
+class VGGPerceptual(torch.nn.Module):
+    """L1 loss on relu3_3 features of a frozen VGG-16.
+
+    Inputs are expected in [-1, 1]; they are renormalised to ImageNet stats
+    before being passed through the network.
+    """
+
+    def __init__(self):
+        super().__init__()
+        vgg = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.DEFAULT)
+        self.features = torch.nn.Sequential(*list(vgg.features)[:16]).eval()
+        for p in self.parameters():
+            p.requires_grad_(False)
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        def prep(t: torch.Tensor) -> torch.Tensor:
+            t = (t.clamp(-1, 1) + 1) / 2          # [-1,1] → [0,1]
+            return (t - self.mean) / self.std       # ImageNet normalisation
+        return F.l1_loss(self.features(prep(x)), self.features(prep(y)))
+
+
 # ── Lightning module ──────────────────────────────────────────────────────────
 
 
@@ -48,6 +74,7 @@ class CVAEModule(pl.LightningModule):
             if self.cfg.attr_loss_weight > 0
             else None
         )
+        self.perceptual = VGGPerceptual()
         self._val_fixed: tuple | None = None
 
     # ── forward ───────────────────────────────────────────────────────────
@@ -68,16 +95,18 @@ class CVAEModule(pl.LightningModule):
         recon, mu, logvar = self(x, c)
 
         recon_loss = F.mse_loss(recon, x, reduction="sum") / x.size(0)
+        perc_loss  = self.perceptual(recon, x)
         kl_loss = (
             -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
         )
-        loss = recon_loss + self._beta() * kl_loss
+        loss = recon_loss + self.cfg.perceptual_weight * perc_loss + self._beta() * kl_loss
 
         logs = {
-            f"{stage}/loss": loss,
+            f"{stage}/loss":  loss,
             f"{stage}/recon": recon_loss,
-            f"{stage}/kl": kl_loss,
-            f"{stage}/beta": self._beta(),
+            f"{stage}/perc":  perc_loss,
+            f"{stage}/kl":    kl_loss,
+            f"{stage}/beta":  self._beta(),
         }
 
         if self.aux is not None:
