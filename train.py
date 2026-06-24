@@ -15,7 +15,11 @@ import torch.nn.functional as F
 import torchvision
 import pytorch_lightning as pl
 import wandb
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import (
+    LearningRateMonitor,
+    ModelCheckpoint,
+    TQDMProgressBar,
+)
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 
@@ -181,6 +185,10 @@ def main():
             auto_insert_metric_name=False,
         ),
         LearningRateMonitor(logging_interval="epoch"),
+        # In Colab, train.py runs via `!python …` so stdout is not a TTY: a
+        # refresh_rate of 1 makes tqdm print a fresh line every step (thousands
+        # of lines). Throttle it — real metrics are in wandb anyway.
+        TQDMProgressBar(refresh_rate=cfg.log_every_n_steps),
     ]
 
     module = CVAEModule(**dataclasses.asdict(cfg))

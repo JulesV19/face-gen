@@ -113,6 +113,11 @@ class CVAE(nn.Module):
         self, x: torch.Tensor, c: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mu, logvar = self.encoder(x, c)
+        # Clamp logvar so exp() (in reparam std and in the KL term) cannot
+        # overflow to inf — without this the reparameterisation explodes during
+        # the β=0 warmup epoch (no KL pressure on the variance) and everything
+        # turns into NaN. Range [-10, 10] keeps std in [~0.007, ~148].
+        logvar = logvar.clamp(-10.0, 10.0)
         z = self.reparameterize(mu, logvar)
         return self.decoder(z, c), mu, logvar
 
