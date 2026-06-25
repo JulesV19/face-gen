@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Tuple
 
 
@@ -15,10 +16,11 @@ def _conv_down(in_ch: int, out_ch: int) -> nn.Sequential:
 
 
 def _conv_up(in_ch: int, out_ch: int) -> nn.Sequential:
+    # GroupNorm only — ReLU is applied after FiLM so the condition modulates before activation
+    num_groups = min(32, max(1, out_ch // 8))
     return nn.Sequential(
         nn.ConvTranspose2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=False),
-        nn.BatchNorm2d(out_ch),
-        nn.ReLU(inplace=True),
+        nn.GroupNorm(num_groups, out_ch),
     )
 
 
@@ -115,6 +117,7 @@ class Decoder(nn.Module):
         chs = [512, 256, 128, 64, 32]
         self.ups   = nn.ModuleList([_conv_up(chs[i], chs[i + 1]) for i in range(4)])
         self.films = nn.ModuleList([FiLM(num_attrs, chs[i + 1]) for i in range(4)])
+        self.attn  = SelfAttn2d(256, num_heads=4)  # at 8×8, after first up (512→256)
 
         self.head = nn.Sequential(
             nn.Conv2d(32, 3, kernel_size=3, stride=1, padding=1),
@@ -124,8 +127,10 @@ class Decoder(nn.Module):
     def forward(self, z: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         h = self.fc(torch.cat([z, c], dim=1))
         h = h.view(h.size(0), 512, self.spatial, self.spatial)
-        for up, film in zip(self.ups, self.films):
-            h = film(up(h), c)
+        for i, (up, film) in enumerate(zip(self.ups, self.films)):
+            h = F.relu(film(up(h), c), inplace=True)
+            if i == 0:
+                h = self.attn(h)  # self-attention at 8×8 (after 512→256 up)
         return self.head(h)
 
 
